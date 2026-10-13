@@ -1,0 +1,7 @@
+# Ignore all
+*
+
+# dont ignore this files
+!.gitignore
+!projekt.c
+!README.md

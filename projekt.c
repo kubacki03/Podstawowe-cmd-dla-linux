@@ -2,38 +2,39 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 
 //Zdefiniowanie nazwy pliku, do którego będzie się zapisywać historia komend
-#define HISTORIA "historia.txt"
+#define HISTORY_FILE "history.txt"
 //Ile linii maksymalnie w historii
-#define MAX_LINIE 20
+#define MAX_HISTORY_LINES 20
 //Maksymalna dlugosc polecenia
-#define MAX_DLUGOSC_LINII 1024
+#define MAX_LINE_LENGTH 1024
 
 //Deklaracja struktury do obslugi sygnalu
 struct sigaction act;
 
 //Flaga informujaca o przechwyceniu sygnalu
-volatile sig_atomic_t przechwycono = 0;
+volatile sig_atomic_t signal_caught = 0;
 
 
 //Funkcja do wykonywania pojedynczego polecenia
-int wykonaj_komende(char *komenda, int output_fd, int nie_czekaj) {
-    int status;
-    pid_t pid = fork();
+int execute_command(char *command_line, int output_fd, int no_wait) {
+    int exit_status;
+    pid_t child_pid = fork();
 
-    char *argumenty[100];
+    char *args[100];
     //Rozdzielanie polecenia na argumenty
-    char *slowo = strtok(komenda, " ");
-    int i = 0;
+    char *token = strtok(command_line, " ");
+    int arg_count = 0;
 
-    while (slowo != NULL) {
-        argumenty[i++] = slowo;
-        slowo = strtok(NULL, " ");
+    while (token != NULL) {
+        args[arg_count++] = token;
+        token = strtok(NULL, " ");
     }
-    argumenty[i] = NULL;
+    args[arg_count] = NULL;
 
     //Jesli wyjscie jest inne niz stand. to przekieruj
     if (output_fd != STDOUT_FILENO) {
@@ -42,21 +43,21 @@ int wykonaj_komende(char *komenda, int output_fd, int nie_czekaj) {
     }
 
 
-    if (pid < 0) {
-        perror("Błąd forkowania procesu");
+    if (child_pid < 0) {
+        perror("Fork error");
         exit(EXIT_FAILURE);
-    } else if (pid == 0) {
+    } else if (child_pid == 0) {
         //Wykonywanie procesu potomnego
-        if (execvp(argumenty[0], argumenty) == -1) {
-            perror("Błąd execvp");
+        if (execvp(args[0], args) == -1) {
+            perror("execvp error");
             exit(EXIT_FAILURE);
         }
     } else {
         //Czekanie na zakonczenie procesu potomnego
-        if (!nie_czekaj) {
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status)) {
-                return WEXITSTATUS(status);
+        if (!no_wait) {
+            waitpid(child_pid, &exit_status, 0);
+            if (WIFEXITED(exit_status)) {
+                return WEXITSTATUS(exit_status);
             }
         }
     }
@@ -64,67 +65,67 @@ int wykonaj_komende(char *komenda, int output_fd, int nie_czekaj) {
 }
 
 //Funkcja do obslugi polecenia, wykrycia potoku
-void obsluz_polecenie(char *polecenia, const char *plik_wyjsciowy, int w_tle) {
-    int liczba_potokow = 0;
+void handle_command(char *pipeline, const char *output_file, int in_background) {
+    int pipe_count = 0;
 
     //Wykrywanie znaku potoku
-    for (char *p = polecenia; *p; p++) {
-        if (*p == '|') liczba_potokow++;
+    for (char *ch = pipeline; *ch; ch++) {
+        if (*ch == '|') pipe_count++;
     }
 
-    int potoki[liczba_potokow][2];
-    for (int i = 0; i < liczba_potokow; i++) {
-        if (pipe(potoki[i]) == -1) {
+    int pipes[pipe_count][2];
+    for (int i = 0; i < pipe_count; i++) {
+        if (pipe(pipes[i]) == -1) {
             perror("pipe");
             exit(EXIT_FAILURE);
         }
     }
 
-    int index_procesu = 0;
-    char *polecenie = strtok(polecenia, "|");
+    int stage_index = 0;
+    char *stage_command = strtok(pipeline, "|");
     int output_fd = STDOUT_FILENO;
 
     //Otwarcie pliku do zapisu jesli wyjscie to nie STDOUT
-    if (plik_wyjsciowy != NULL && strcmp(plik_wyjsciowy, "stdout") != 0) {
-        output_fd = open(plik_wyjsciowy, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (output_file != NULL && strcmp(output_file, "stdout") != 0) {
+        output_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (output_fd == -1) {
-            perror("Błąd otwarcia");
+            perror("Open error");
             exit(EXIT_FAILURE);
         }
     }
 
-    while (polecenie) {
+    while (stage_command) {
         if (fork() == 0) {
-            if (index_procesu > 0) {
-                dup2(potoki[index_procesu - 1][0], STDIN_FILENO);
+            if (stage_index > 0) {
+                dup2(pipes[stage_index - 1][0], STDIN_FILENO);
             }
-            if (index_procesu < liczba_potokow) {
-                dup2(potoki[index_procesu][1], STDOUT_FILENO);
+            if (stage_index < pipe_count) {
+                dup2(pipes[stage_index][1], STDOUT_FILENO);
             }
 
             //Zamykanie deskryptorow plikow
-            for (int i = 0; i < liczba_potokow; i++) {
-                close(potoki[i][0]);
-                close(potoki[i][1]);
+            for (int i = 0; i < pipe_count; i++) {
+                close(pipes[i][0]);
+                close(pipes[i][1]);
             }
 
-            if (index_procesu == liczba_potokow) {
+            if (stage_index == pipe_count) {
                 dup2(output_fd, STDOUT_FILENO);
             }
 
             //Wykonanie polecenia
-            wykonaj_komende(polecenie, STDOUT_FILENO, w_tle);
+            execute_command(stage_command, STDOUT_FILENO, in_background);
             exit(EXIT_FAILURE);
         }
 
         //Wydziela kolejne polecenie po |
-        polecenie = strtok(NULL, "|");
-        index_procesu++;
+        stage_command = strtok(NULL, "|");
+        stage_index++;
     }
 
-    for (int i = 0; i < liczba_potokow; i++) {
-        close(potoki[i][0]);
-        close(potoki[i][1]);
+    for (int i = 0; i < pipe_count; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
     }
 
 
@@ -137,99 +138,99 @@ void obsluz_polecenie(char *polecenia, const char *plik_wyjsciowy, int w_tle) {
 }
 
 //Funkcja do odczytu historii
-void odczytaj_historie(int sig) {
+void print_history(int signal_number) {
 
-     przechwycono = 1;
+    signal_caught = 1;
 
-    FILE *plik;
-    char linia[MAX_DLUGOSC_LINII];
+    FILE *history_file;
+    char line[MAX_LINE_LENGTH];
 
     //Otwarcie pliku w trybie odczytu
-    plik = fopen(HISTORIA, "r");
-    if (plik == NULL) {
+    history_file = fopen(HISTORY_FILE, "r");
+    if (history_file == NULL) {
         //Jesli plik nie istnieje to zostaje utworzony
-        printf("Plik nie istnieje, zostal wlasnie stworzony\n");
-        plik = fopen(HISTORIA, "w+");
-        if (plik == NULL) {
-            printf("Nie można utworzyć nowego pliku.\n");
+        printf("File does not exist, it has just been created\n");
+        history_file = fopen(HISTORY_FILE, "w+");
+        if (history_file == NULL) {
+            printf("Could not create a new file.\n");
             return;
         }
     } else {
-        printf("Zawartość historii:\n");
-        int i=1;
-        while (fgets(linia, sizeof(linia), plik) != NULL ) {
+        printf("History contents:\n");
+        int line_number = 1;
+        while (fgets(line, sizeof(line), history_file) != NULL) {
 
-            printf("%d) %s",i, linia);
-            i++;
+            printf("%d) %s", line_number, line);
+            line_number++;
 
 
         }
 
     }
     //Zamykamy plik z historia
-    fclose(plik);
+    fclose(history_file);
 
 }
 
 
-int zapisz_historie(const char *linia) {
+int save_history(const char *new_entry) {
     //Pomijamy puste polecenia
-    if (linia == NULL || linia[0] == '\0' || linia[0] == '\n') {
+    if (new_entry == NULL || new_entry[0] == '\0' || new_entry[0] == '\n') {
         return 1;
     }
 
-    FILE *plik;
-    char bufor[MAX_DLUGOSC_LINII];
-    char *linie[MAX_LINIE];
-    int licznik = 0;
+    FILE *history_file;
+    char read_buffer[MAX_LINE_LENGTH];
+    char *history_lines[MAX_HISTORY_LINES];
+    int line_count = 0;
 
-    plik = fopen(HISTORIA, "r");
-    if (plik != NULL) {
+    history_file = fopen(HISTORY_FILE, "r");
+    if (history_file != NULL) {
 
-    //Skopiowanie i okreslenie ile wierszy jest w pliku
-        while (fgets(bufor, sizeof(bufor), plik) != NULL && licznik < MAX_LINIE) {
-            linie[licznik] = strdup(bufor);
-            licznik++;
+        //Skopiowanie i okreslenie ile wierszy jest w pliku
+        while (fgets(read_buffer, sizeof(read_buffer), history_file) != NULL && line_count < MAX_HISTORY_LINES) {
+            history_lines[line_count] = strdup(read_buffer);
+            line_count++;
         }
-        fclose(plik);
+        fclose(history_file);
     }
 
 
-    plik = fopen(HISTORIA, "w");
-    if (plik == NULL) {
+    history_file = fopen(HISTORY_FILE, "w");
+    if (history_file == NULL) {
         //Jesli nie mozna otworzyc pliku to zwalniamy zajeta pamiec
-        printf("Nie można otworzyć pliku HISTORIA.\n");
-        for (int i = 0; i < licznik; i++) {
-            free(linie[i]);
+        printf("Could not open the history file.\n");
+        for (int i = 0; i < line_count; i++) {
+            free(history_lines[i]);
 
-       }
+        }
 
         return -1;
     }
 
     // Jesli liczba wierszy jest za wysoka to usuwamy najstarsze
-    if (licznik >= MAX_LINIE) {
-        for (int i = 1; i < MAX_LINIE; i++) {
-            free(linie[i - 1]);
+    if (line_count >= MAX_HISTORY_LINES) {
+        for (int i = 1; i < MAX_HISTORY_LINES; i++) {
+            free(history_lines[i - 1]);
             //Przesuwanie wierszy do góry
-            linie[i - 1] = strdup(linie[i]);
+            history_lines[i - 1] = strdup(history_lines[i]);
         }
         //Zwalniamy pamiec by zapobiec wyciekowi pamieci
-        free(linie[19]);
+        free(history_lines[MAX_HISTORY_LINES - 1]);
 
-        licznik--;
+        line_count--;
     }
 
 
-    linie[licznik++] = strdup(linia);
+    history_lines[line_count++] = strdup(new_entry);
 
     //Zapisanie polecen do pliku i zwalnianie pamieci
-    for (int i = 0; i < licznik; i++) {
-        fputs(linie[i], plik);
-        free(linie[i]);
+    for (int i = 0; i < line_count; i++) {
+        fputs(history_lines[i], history_file);
+        free(history_lines[i]);
     }
 
-    fclose(plik);
+    fclose(history_file);
     return 0;
 }
 
@@ -237,96 +238,94 @@ int zapisz_historie(const char *linia) {
 int main() {
     //Struktura do obslugi sygnalow
     struct sigaction act;
-    //Do reakcji na sygnal sluzy odczytaj_historie()
-    act.sa_handler = odczytaj_historie;
+    //Do reakcji na sygnal sluzy print_history()
+    act.sa_handler = print_history;
     sigemptyset(&act.sa_mask);
     act.sa_flags = 0;
     //Jesli otrzymamy SIGINT obsluz strukture act
     sigaction(SIGINT, &act, NULL);
 
-    char zapisz[MAX_DLUGOSC_LINII];
-    char polecenie[MAX_DLUGOSC_LINII];
+    char raw_input[MAX_LINE_LENGTH];
+    char command_line[MAX_LINE_LENGTH];
     while (1) {
 
-        if (przechwycono) {
-            przechwycono = 0;
+        if (signal_caught) {
+            signal_caught = 0;
             continue;
         }
 
         printf("cmd> ");
-        int w_tle = 0;
-        if (fgets(polecenie, sizeof(polecenie), stdin) == NULL) {
-            if (przechwycono) {
-                przechwycono = 0;
+        int in_background = 0;
+        if (fgets(command_line, sizeof(command_line), stdin) == NULL) {
+            if (signal_caught) {
+                signal_caught = 0;
                 continue;
             }
-            perror("Błąd fgets");
+            perror("fgets error");
             return 1;
         }
-        //Kopiujemy tresc polecenia do zapisz by zachowac >> & itp.
-        memcpy(zapisz, polecenie, sizeof(polecenie));
-        polecenie[strcspn(polecenie, "\n")] = 0;
+        //Kopiujemy tresc polecenia do raw_input by zachowac >> & itp.
+        memcpy(raw_input, command_line, sizeof(command_line));
+        command_line[strcspn(command_line, "\n")] = 0;
 
         //Jesli polecenie to end to zakoncz dzialanie
-        if (strcmp(polecenie, "end") == 0) {
+        if (strcmp(command_line, "end") == 0) {
             break;
         }
 
-        char bufor[MAX_DLUGOSC_LINII];
-        strcpy(bufor, polecenie);
+        char parse_buffer[MAX_LINE_LENGTH];
+        strcpy(parse_buffer, command_line);
 
-        char *slowo;
-        char *argumenty[64];
-        int i = 0;
-        slowo = strtok(bufor, " ");
-        while (slowo != NULL) {
-            argumenty[i++] = slowo;
-            slowo = strtok(NULL, " ");
+        char *token;
+        char *words[64];
+        int word_count = 0;
+        token = strtok(parse_buffer, " ");
+        while (token != NULL) {
+            words[word_count++] = token;
+            token = strtok(NULL, " ");
         }
-        argumenty[i] = NULL;
+        words[word_count] = NULL;
 
-        int czy_zapis = 0;
-        char adres[MAX_DLUGOSC_LINII];
-        char plik[MAX_DLUGOSC_LINII];
-        plik[0] = '\0';
+        int redirect_to_file = 0;
+        char output_path[MAX_LINE_LENGTH];
 
-        // x sluzy do okreslenie ktory znak usunac w zaleznosci czy w ciagu jest & czy nie
-        int x = 2;
+        // redirect_offset okresla ktory od konca wyraz to >> w zaleznosci czy w ciagu jest & czy nie
+        int redirect_offset = 2;
 
-        //Jesli ostatni znak to & to zmieniamy w_tle na true
-        if (i > 1 && strcmp(argumenty[i - 1], "&") == 0) {
-            w_tle = 1;
-            x++;
+        //Jesli ostatni znak to & to zmieniamy in_background na true
+        if (word_count > 1 && strcmp(words[word_count - 1], "&") == 0) {
+            in_background = 1;
+            redirect_offset++;
         }
 
-        //Jesli >> to 3 ostatni lub przedostatni znak to zmieniamy flage czy_zapis na 1
+        //Jesli >> to 3 ostatni lub przedostatni znak to zmieniamy flage redirect_to_file na 1
         //Nastepny wyraz po >> to nazwa pliku
-        if (i > 2 && strcmp(argumenty[i - x], ">>") == 0) {
-            czy_zapis = 1;
-            strcpy(adres, argumenty[i - x + 1]);
+        if (word_count > 2 && strcmp(words[word_count - redirect_offset], ">>") == 0) {
+            redirect_to_file = 1;
+            strcpy(output_path, words[word_count - redirect_offset + 1]);
         }
 
         //Usuwamy wykryte znaki kopiujac w ich miejsce pusty ciag
-        char *ukryj = strstr(polecenie, "&");
-        if (ukryj != NULL) {
-            strcpy(ukryj, "");
+        char *ampersand_pos = strstr(command_line, "&");
+        if (ampersand_pos != NULL) {
+            strcpy(ampersand_pos, "");
         }
 
-        char *przekieruj = strstr(polecenie, ">>");
-        if (przekieruj != NULL) {
-            strcpy(przekieruj, "");
+        char *redirect_pos = strstr(command_line, ">>");
+        if (redirect_pos != NULL) {
+            strcpy(redirect_pos, "");
         }
 
-        //Jesli chcemy zapisac wynik w pliku to zostanie on zapisany w pliku adres
-        if (czy_zapis == 1) {
-            obsluz_polecenie(polecenie, adres, w_tle);
+        //Jesli chcemy zapisac wynik w pliku to zostanie on zapisany w pliku output_path
+        if (redirect_to_file == 1) {
+            handle_command(command_line, output_path, in_background);
         } else {
             //Jesli nie to wynik zostanie wyswietlony na stand. wyjsciu
-            obsluz_polecenie(polecenie, "stdout", w_tle);
+            handle_command(command_line, "stdout", in_background);
         }
 
-   //Zapisujemy polecenie
-   zapisz_historie(zapisz);
+        //Zapisujemy polecenie
+        save_history(raw_input);
     }
 
     return 0;
